@@ -4,7 +4,7 @@
 # check if the number of arguments passed are 2
 if [ $# -ne 2 ]
  then
- echo "number of arguements are invalid"
+ echo "number of arguement are invalid"
  exit 1
 fi
 
