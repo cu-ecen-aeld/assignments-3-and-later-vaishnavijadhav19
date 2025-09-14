@@ -1,5 +1,5 @@
 
-CC      := $(Cross)gcc
+CC      := $(CROSS_COMPILE)gcc
 CFLAGS  ?= -Wall -Wextra -Werror -std=c11
 LDFLAGS ?=
 
