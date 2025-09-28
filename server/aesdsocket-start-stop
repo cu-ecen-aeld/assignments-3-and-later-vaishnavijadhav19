@@ -1,6 +1,6 @@
 #!/bin/sh
 
-DAEMON_PATH=/home/root/server/aesdsocket   # <-- update this path to your compiled aesdsocket
+DAEMON_PATH=aesdsocket   # <-- update this path to your compiled aesdsocket
 DAEMON_NAME=aesdsocket
 PIDFILE=/var/run/$DAEMON_NAME.pid
 
