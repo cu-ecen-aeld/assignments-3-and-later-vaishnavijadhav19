@@ -1,4 +1,4 @@
-CC      ?= gcc
+CC      ?= $(CROSS_COMPILE)gcc
 CFLAGS  ?= -Wall -Wextra -Werror -O2
 LDFLAGS ?=
 
