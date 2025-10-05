@@ -527,6 +527,9 @@ int main(int argc, char *argv[])
     
     closelog();
     
+    
+    
+    
     return EXIT_SUCCESS;
 }
 
