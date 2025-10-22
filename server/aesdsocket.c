@@ -26,8 +26,17 @@
 
 #define BUF_SIZE        1024
 
-#define FILE_PATH       "/var/tmp/aesdsocketdata"
+//#define FILE_PATH       "/var/tmp/aesdsocketdata"
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define FILE_PATH "/dev/aesdchar"
+#else
+#define FILE_PATH "/var/tmp/aesdsocketdata"
+#endif
 
 
 static int listen_fd = -1;
@@ -88,151 +97,201 @@ static void log_peer(const char *prefix, const struct sockaddr_in *addr)
 
 
 
+
+
+
 static void *connection_thread(void *arg)
 {
     struct client_thread *self = (struct client_thread *)arg;
     
     int cfd = self->client_fd;
     
-    char buf[BUF_SIZE];
+    char buffer[BUF_SIZE];
     
-    ssize_t nread;
+    char *acc = NULL;
     
-    bool saw_newline = false;
-
-    log_peer("Thread handling client", &self->client_addr);
+    size_t acc_len = 0;
 
    
-    while (!g_exit_requested)
+    log_peer("Thread handling client", &self->client_addr);
+
+    for (;;)
      {
-        nread = recv(cfd, buf, sizeof(buf), 0);
+        // receive data from the client
+        ssize_t n = recv(cfd, buffer, sizeof(buffer), 0);
         
-        
-        if (nread < 0)
-         {
-            if (errno == EINTR) continue;
-            syslog(LOG_ERR, "recv failed: %s", strerror(errno));
-            break;
-        }
-        
-        
-        if (nread == 0) 
+        if (n < 0) 
         {
-          
-            break;
+            // retry if interrupted, else log error
+            if (errno == EINTR) continue;
+            
+            syslog(LOG_ERR, "recv error: %s", strerror(errno));
+            
+            goto cleanup;
+        }
+        if (n == 0)
+         {
+           //if no data connection closed
+            if (acc_len == 0) goto cleanup;
+            
+#if USE_AESD_CHAR_DEVICE
+
+            //make sure command ends with new line 
+            if (acc[acc_len - 1] != '\n') 
+            {
+                char *tmp = realloc(acc, acc_len + 1); //allocate byte sized space for newline
+                
+                
+                if (!tmp) 
+                {
+                    syslog(LOG_ERR, "realloc error");
+                    goto cleanup;
+                }
+                
+                acc = tmp;
+                
+                acc[acc_len++] = '\n';// append new line at the end 
+            }
+#endif
+        } 
+        else 
+        {
+           
+            char *tmp = realloc(acc, acc_len + (size_t)n);
+            
+            if (!tmp)
+             {
+                syslog(LOG_ERR, "realloc error");
+                goto cleanup;
+            }
+            
+            acc = tmp;
+            
+            memcpy(acc + acc_len, buffer, (size_t)n);
+            
+            acc_len += (size_t)n;
+
+           
+            if (memchr(acc, '\n', acc_len) == NULL) continue;
         }
 
        
-        if (pthread_mutex_lock(&file_mutex) != 0) 
-        {
+        if (pthread_mutex_lock(&file_mutex) != 0)
+         {
             syslog(LOG_ERR, "mutex lock failed");
-            break;
+            goto cleanup;
         }
 
-        FILE *fp = fopen(FILE_PATH, "a+");
+     
+        size_t line_len = acc_len;
         
+        char *nlp = memchr(acc, '\n', acc_len);
         
+        if (nlp) line_len = (size_t)(nlp - acc) + 1;
+
+      
+        int wfd = open(FILE_PATH, O_WRONLY); //accessed only when client sends data
         
-        if (!fp) 
+        if (wfd < 0) 
         {
-            syslog(LOG_ERR, "fopen append failed: %s", strerror(errno));
+            syslog(LOG_ERR, "open write error: %s", strerror(errno));
+            
             
             pthread_mutex_unlock(&file_mutex);
-            
-            break;
+            goto cleanup;
         }
 
-        size_t wr = fwrite(buf, 1, (size_t)nread, fp);
         
+        size_t off = 0;
         
-        if (wr != (size_t)nread)
+        while (off < line_len)
          {
-             syslog(LOG_ERR, "fwrite failed: %s", strerror(errno));
+            ssize_t w = write(wfd, acc + off, line_len - off);
             
-            fclose(fp);
             
-            pthread_mutex_unlock(&file_mutex);
-            break;
-        }
-        fflush(fp);
-        
-
-        if (memchr(buf, '\n', (size_t)nread) != NULL)
-         {
-            saw_newline = true;
-        }
-
-
-
-        if (saw_newline) 
-        {
-            if (fseek(fp, 0, SEEK_SET) != 0) 
-            {
-                syslog(LOG_ERR, "fseek failed: %s", strerror(errno));
+            if (w < 0)
+             {
+                if (errno == EINTR) continue;
                 
-                fclose(fp);
+                
+                syslog(LOG_ERR, "write error: %s", strerror(errno));
+                
+                close(wfd);
                 
                 pthread_mutex_unlock(&file_mutex);
+                goto cleanup;
+            }
+            
+            
+            off += (size_t)w;
+        }
+        
+        close(wfd);
+
+        
+        int rfd = open(FILE_PATH, O_RDONLY); //reads data
+        if (rfd < 0)
+         {
+            syslog(LOG_ERR, "open read error: %s", strerror(errno));
+            
+            pthread_mutex_unlock(&file_mutex);
+            goto cleanup;
+        }
+        
+        
+        for (;;) 
+        {
+            ssize_t r = read(rfd, buffer, sizeof(buffer));
+            
+            
+            if (r < 0) 
+            {
+                if (errno == EINTR) continue;
+                syslog(LOG_ERR, "read error: %s", strerror(errno));
                 break;
             }
             
             
-
-            char sbuf[BUF_SIZE];
+            if (r == 0) break; 
             
-            size_t r;
+            size_t sent = 0;
             
-            while ((r = fread(sbuf, 1, sizeof(sbuf), fp)) > 0)
+            while (sent < (size_t)r)
              {
-                size_t off = 0;
+                ssize_t s = send(cfd, buffer + sent, (size_t)r - sent, 0);
                 
-                while (off < r)
+                if (s < 0)
                  {
-                    ssize_t sn = send(cfd, sbuf + off, r - off, 0);
-                    
-                    if (sn < 0) 
-                    {
-                        if (errno == EINTR) continue;
-                        if (errno == EPIPE || errno == ECONNRESET)
-                         {
-                            r = 0; 
-                            break;
-                        }
-                        
-                        
-                        syslog(LOG_ERR, "send failed: %s", strerror(errno));
-                        
-                        r = 0;
-                        break;
-                    }
-                    
-                    
-                    off += (size_t)sn;
+                    if (errno == EINTR) continue;
+                    r = 0;
+                    break;
                 }
+                
+                
+                sent += (size_t)s;
             }
-
-             fclose(fp);
             
-            pthread_mutex_unlock(&file_mutex);
-            break; 
+            if (r == 0) break;
         }
-
-        fclose(fp);
+        
+        close(rfd);
+        
         pthread_mutex_unlock(&file_mutex);
+
+        break; 
     }
 
-    log_peer("Client disconnected", &self->client_addr);
-    
+cleanup:
+    free(acc);
     close(cfd);
-    
     self->client_fd = -1;
-    
     self->done = true;
+
+   
+    log_peer("Client disconnected", &self->client_addr);
     
     return NULL;
 }
-
-
 
 
 static int daemonize(void)
@@ -274,7 +333,7 @@ static int daemonize(void)
 }
 
 
-
+#if !USE_AESD_CHAR_DEVICE
 static void *timestamp_thread(void *arg)
 {
     (void)arg;
@@ -316,7 +375,7 @@ static void *timestamp_thread(void *arg)
     }
     return NULL;
 }
-
+#endif
 
 
 
@@ -324,9 +383,13 @@ int main(int argc, char *argv[])
 {
     int daemon_mode = (argc == 2 && strcmp(argv[1], "-d") == 0);
     
+    
+ 
+    #if !USE_AESD_CHAR_DEVICE
     pthread_t ts_tid;
     bool ts_started = false;
-
+    #endif
+    
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
     
@@ -407,7 +470,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    
+  #if !USE_AESD_CHAR_DEVICE
     if (pthread_create(&ts_tid, NULL, timestamp_thread, NULL) != 0) 
     {
         syslog(LOG_ERR, "Failed to create timestamp thread");
@@ -420,6 +483,7 @@ int main(int argc, char *argv[])
     }
     
     ts_started = true;
+  #endif
 
     syslog(LOG_INFO, "Server listening on port %d", PORT);
 
@@ -515,11 +579,13 @@ int main(int argc, char *argv[])
         free(it2);
     }
 
- 
+    #if !USE_AESD_CHAR_DEVICE
     if (ts_started) pthread_join(ts_tid, NULL);
+    #endif
 
-    
+    #if !USE_AESD_CHAR_DEVICE
     remove(FILE_PATH);
+    #endif
     
     pthread_mutex_destroy(&file_mutex);
 
