@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 
 #include <time.h>
@@ -136,22 +137,9 @@ static void *connection_thread(void *arg)
             
 #if USE_AESD_CHAR_DEVICE
 
-            //make sure command ends with new line 
-            if (acc[acc_len - 1] != '\n') 
-            {
-                char *tmp = realloc(acc, acc_len + 1); //allocate byte sized space for newline
-                
-                
-                if (!tmp) 
-                {
-                    syslog(LOG_ERR, "realloc error");
-                    goto cleanup;
-                }
-                
-                acc = tmp;
-                
-                acc[acc_len++] = '\n';// append new line at the end 
-            }
+               //make sure command ends with new line 
+           if (memchr(acc, '\n', acc_len) == NULL)
+    continue;
 #endif
         } 
         else 
@@ -181,105 +169,155 @@ static void *connection_thread(void *arg)
             syslog(LOG_ERR, "mutex lock failed");
             goto cleanup;
         }
+if (strncmp(acc, "AESDCHAR_IOCSEEKTO:", 19) == 0)
+{
+#if USE_AESD_CHAR_DEVICE
+    struct aesd_seekto seekto;
 
-     
-        size_t line_len = acc_len;
-        
-        char *nlp = memchr(acc, '\n', acc_len);
-        
-        if (nlp) line_len = (size_t)(nlp - acc) + 1;
+    //parses command in req format
+    if (sscanf(acc + 19, "%u,%u", &seekto.write_cmd, &seekto.write_cmd_offset) == 2)
+    {
+        syslog(LOG_INFO, "IOCTL command received: write_cmd=%u, offset=%u", seekto.write_cmd, seekto.write_cmd_offset);
 
-      
-        int wfd = open(FILE_PATH, O_WRONLY); //accessed only when client sends data
+       //open in read and write mode
+        int fd = open(FILE_PATH, O_RDWR);
         
-        if (wfd < 0) 
+        if (fd < 0)
         {
-            syslog(LOG_ERR, "open write error: %s", strerror(errno));
-            
+            syslog(LOG_ERR, "open error: %s", strerror(errno));
             
             pthread_mutex_unlock(&file_mutex);
             goto cleanup;
         }
 
-        
-        size_t off = 0;
-        
-        while (off < line_len)
-         {
-            ssize_t w = write(wfd, acc + off, line_len - off);
-            
-            
-            if (w < 0)
-             {
-                if (errno == EINTR) continue;
-                
-                
-                syslog(LOG_ERR, "write error: %s", strerror(errno));
-                
-                close(wfd);
-                
-                pthread_mutex_unlock(&file_mutex);
-                goto cleanup;
-            }
-            
-            
-            off += (size_t)w;
-        }
-        
-        close(wfd);
-
-        
-        int rfd = open(FILE_PATH, O_RDONLY); //reads data
-        if (rfd < 0)
-         {
-            syslog(LOG_ERR, "open read error: %s", strerror(errno));
-            
-            pthread_mutex_unlock(&file_mutex);
-            goto cleanup;
-        }
-        
-        
-        for (;;) 
+       //perform ioctl and seek
+        if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == 0)
         {
-            ssize_t r = read(rfd, buffer, sizeof(buffer));
+           //reads data from new offset if seek is successful
+            ssize_t r;
             
-            
-            if (r < 0) 
+            while ((r = read(fd, buffer, sizeof(buffer))) > 0)
             {
-                if (errno == EINTR) continue;
-                syslog(LOG_ERR, "read error: %s", strerror(errno));
-                break;
-            }
-            
-            
-            if (r == 0) break; 
-            
-            size_t sent = 0;
-            
-            while (sent < (size_t)r)
-             {
-                ssize_t s = send(cfd, buffer + sent, (size_t)r - sent, 0);
+                ssize_t sent = 0;
                 
-                if (s < 0)
-                 {
-                    if (errno == EINTR) continue;
-                    r = 0;
-                    break;
+                while (sent < r)
+                {
+                    ssize_t s = send(cfd, buffer + sent, r - sent, 0);
+                    
+                    if (s < 0)
+                    {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+                    
+                    sent += s; //updates total bytes sent 
                 }
-                
-                
-                sent += (size_t)s;
             }
-            
-            if (r == 0) break;
         }
-        
-        close(rfd);
-        
-        pthread_mutex_unlock(&file_mutex);
+        else
+        {
+            syslog(LOG_ERR, "ioctl failed: %s", strerror(errno));
+        }
 
-        break; 
+        close(fd);
     }
+    else
+    {
+        syslog(LOG_ERR, "format invalid");
+    }
+
+    pthread_mutex_unlock(&file_mutex);
+    
+    free(acc);
+    acc = NULL;
+    acc_len = 0;
+    continue; 
+    
+#endif
+}
+	else
+	{
+	    
+	       size_t line_len = acc_len;
+	       
+	char *nlp = memchr(acc, '\n', acc_len); //check for new line 
+
+	if (nlp) 
+	    line_len = (size_t)(nlp - acc) + 1; //calculate length including new line
+
+        //open in read and write mode(uses same fd)
+	int fd = open(FILE_PATH, O_RDWR);
+
+	if (fd < 0)
+	{
+	    syslog(LOG_ERR, "open error: %s", strerror(errno));
+	    
+	    pthread_mutex_unlock(&file_mutex);
+	    goto cleanup;
+	}
+
+size_t off = 0;
+
+	while (off < line_len)
+	{
+	    ssize_t w = write(fd, acc + off, line_len - off); //write the command  
+	    
+	    if (w < 0)
+	    {
+		if (errno == EINTR) continue;
+		syslog(LOG_ERR, "write error: %s", strerror(errno));
+		close(fd);
+		pthread_mutex_unlock(&file_mutex);
+		goto cleanup;
+	    }
+	    
+	    off += (size_t)w;
+	}
+
+
+     lseek(fd, 0, SEEK_SET); //reset file position
+
+for (;;)
+{
+    ssize_t r = read(fd, buffer, sizeof(buffer)); //read
+    if (r < 0)
+    {
+        if (errno == EINTR) continue;
+        
+        syslog(LOG_ERR, "read error: %s", strerror(errno));
+        
+        break;
+    }
+
+    if (r == 0) break; //eof reached
+
+    size_t sent = 0;
+    while (sent < (size_t)r)
+    {
+        ssize_t s = send(cfd, buffer + sent, (size_t)r - sent, 0);
+        if (s < 0)
+        {
+            if (errno == EINTR) continue;
+            
+            r = 0;
+            break;
+        }
+        sent += (size_t)s;
+    }
+
+    if (r == 0) break;
+}
+
+
+   close(fd);
+   
+   pthread_mutex_unlock(&file_mutex);
+   
+   break;
+
+    }
+    
+  }
 
 cleanup:
     free(acc);
@@ -288,7 +326,7 @@ cleanup:
     self->done = true;
 
    
-    log_peer("Client disconnected", &self->client_addr);
+    log_peer("client disconnected", &self->client_addr);
     
     return NULL;
 }
