@@ -78,10 +78,37 @@ loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
     for (i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++)
         if (dev->buffer.entry[i].buffptr)
             total += dev->buffer.entry[i].size;
+            
 
      // perform the seek within total data size
-    newpos = fixed_size_llseek(filp, offset, whence, total);
+   switch (whence) 
+   {
+    case SEEK_SET:
+        newpos = offset;
+        break;
+        
+    case SEEK_CUR:
+        newpos = filp->f_pos + offset;
+        break;
+        
+    case SEEK_END:
+        newpos = total + offset;
+        break;
+        
+    default:
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    //Reject negative positions 
+    if (newpos < 0 || newpos > total)
+     {
+        mutex_unlock(&dev->lock);
+        
+        return -EINVAL;
+    }
     
+    filp->f_pos = newpos; //updat position
     
     mutex_unlock(&dev->lock);
     
